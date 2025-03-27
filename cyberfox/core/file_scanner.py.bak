@@ -1,0 +1,850 @@
+"""
+File system scanner for detecting malicious files and suspicious patterns.
+"""
+import os
+import hashlib
+import time
+import psutil
+import threading
+import queue
+import logging
+import math
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Set, Generator, Tuple, Optional, Callable, Any, Union
+
+# Try importing magic but provide fallback if it fails
+try:
+    import magic
+except ImportError:
+    # Fallback implementation for file type detection if python-magic is not available
+    class FallbackMagic:
+        def __init__(self, mime=False):
+            self.mime = mime
+            
+        def from_file(self, filepath):
+            """Simple fallback for basic file type detection"""
+            # Try to guess mime type based on extension
+            ext = os.path.splitext(filepath)[1].lower()
+            
+            if self.mime:
+                # Return mime type
+                if ext in ('.txt', '.md', '.csv'):
+                    return 'text/plain'
+                elif ext in ('.jpg', '.jpeg'):
+                    return 'image/jpeg'
+                elif ext in ('.png'):
+                    return 'image/png'
+                elif ext in ('.exe', '.com', '.dll'):
+                    return 'application/x-dosexec'
+                elif ext in ('.zip'):
+                    return 'application/zip'
+                elif ext in ('.pdf'):
+                    return 'application/pdf'
+                else:
+                    return 'application/octet-stream'
+            else:
+                # Return description
+                if ext in ('.txt', '.md'):
+                    return 'ASCII text'
+                elif ext in ('.exe', '.com'):
+                    return 'executable'
+                elif ext in ('.dll'):
+                    return 'dynamic link library'
+                elif ext in ('.jpg', '.jpeg', '.png', '.gif'):
+                    return 'image data'
+                else:
+                    return 'data'
+    
+    # Magic module fallback
+    class MagicModule:
+        def Magic(self, mime=False):
+            return FallbackMagic(mime=mime)
+    
+    magic = MagicModule()
+
+from cyberfox.config import CONFIG
+from cyberfox.core.threats import Threat, FileThreat, ThreatType, ThreatLevel
+
+# Initialize logger
+logger = logging.getLogger(__name__)
+
+# Known malicious file signatures (MD5 hashes)
+# This is just a small example list - in a real app, this would be much larger
+# and regularly updated from a threat intelligence feed
+KNOWN_MALICIOUS_HASHES = {
+    "e44e0f0f5c6b47f2499011e49f0996fd": ThreatLevel.CRITICAL,  # Example malware hash
+    "7b502c3a1f48c8609ae212cdfb639dee": ThreatLevel.HIGH,      # Example malware hash
+    "23b431deb752f3153756730c9aedfcbd": ThreatLevel.MEDIUM,    # Example malware hash
+    # Added additional signatures
+    "d8d093b0fd4b9e43c6df6d1e4d1c536f": ThreatLevel.CRITICAL,  # Example ransomware hash
+    "a11a38ca3a73995f49e2fd6a88fd6e0e": ThreatLevel.CRITICAL,  # Example rootkit hash
+    "8a883abec943a3daa480860c4c542ee2": ThreatLevel.HIGH,      # Example trojan hash
+    "9162bf3cd8ae937f4861ca9beccf7736": ThreatLevel.HIGH,      # Example backdoor hash
+}
+
+# File types that may be suspicious in certain contexts
+SUSPICIOUS_FILE_TYPES = {
+    "application/x-dosexec": "Windows executable",
+    "application/x-executable": "Linux executable",
+    "application/x-elf": "ELF executable", 
+    "application/x-msdownload": "Windows DLL",
+    "application/x-ms-shortcut": "Windows shortcut",
+    "application/x-sh": "Shell script",
+    "application/x-bat": "Batch file",
+    "application/x-javascript": "JavaScript",
+    "application/hta": "HTML Application",
+    "application/vnd.microsoft.portable-executable": "PE file"
+}
+
+# Suspicious file patterns categorized by threat type
+SUSPICIOUS_PATTERNS = {
+    # Shell command execution
+    "command_execution": [
+        b"eval(base64_decode",
+        b"powershell -e ",
+        b"cmd.exe /c ",
+        b"shell_exec(",
+        b"subprocess.call",
+        b"os.system(",
+        b"exec(",
+        b"Runtime.getRuntime().exec",
+        b"system(",
+        b"/bin/sh",
+        b"ProcessBuilder",
+        b"Process.Start(",
+        b"rundll32",
+        b"bash -i",
+        b"WScript.Shell",
+    ],
+    
+    # System modification
+    "system_modification": [
+        b"net user administrator",
+        b"Set-MpPreference",
+        b"reg add HKCU\\Software",
+        b"reg delete",
+        b"Get-WmiObject Win32_Service",
+        b"Set-ItemProperty -Path 'HKLM:",
+        b"sc stop ",
+        b"taskkill /f",
+        b"schtasks /create",
+        b"attrib +h",
+        b"icacls",
+        b"chmod 777",
+        b"shutdown /r",
+        b"net share",
+        b"reg.exe",
+    ],
+    
+    # Data exfiltration
+    "data_exfiltration": [
+        b"wget http",
+        b"curl http",
+        b"Invoke-WebRequest",
+        b"HttpWebRequest",
+        b"XMLHttpRequest",
+        b"Net.WebClient",
+        b"FtpWebRequest",
+        b"document.location",
+        b"navigator.sendBeacon",
+        b"fetch(",
+        b"POST http",
+        b"new Socket(",
+        b"ftp://",
+        b"smb://",
+    ],
+    
+    # Memory manipulation
+    "memory_manipulation": [
+        b"VirtualAlloc",
+        b"CreateRemoteThread",
+        b"WriteProcessMemory",
+        b"memcpy",
+        b"RtlCopyMemory",
+        b"ReadProcessMemory",
+        b"CreateProcess",
+        b"HeapAlloc",
+        b"MEM_COMMIT",
+        b"VirtualProtect",
+        b"mprotect",
+        b"mmap(",
+    ],
+    
+    # Registry manipulation
+    "registry_manipulation": [
+        b"RegOpenKeyEx",
+        b"RegSetValueEx",
+        b"RegCreateKeyEx",
+        b"RegDeleteValue",
+        b"RegQueryValueEx",
+        b"HKEY_LOCAL_MACHINE",
+        b"HKEY_CURRENT_USER",
+    ],
+    
+    # Persistence mechanisms
+    "persistence": [
+        b"CurrentVersion\\Run",
+        b"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        b"HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        b"HKLM\\SYSTEM\\CurrentControlSet\\Services",
+        b"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        b"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Userinit",
+        b"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Shell",
+        b"\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+        b"crontab -e",
+        b"StartupItems",
+        b"/etc/rc.local",
+        b"/etc/init.d/",
+        b"systemctl enable",
+        b"launchctl",
+    ],
+    
+    # Encryption (potential ransomware)
+    "encryption": [
+        b"CryptoAPI",
+        b"AES.MODE_",
+        b"Cipher(",
+        b"crypto.subtle",
+        b"RSA.encrypt",
+        b"aes-256-cbc",
+        b"PBKDF2",
+        b"CryptoJS",
+        b"OpenSSL_encrypt",
+        b"ransomware",
+        b"your files have been encrypted",
+        b"decrypt key",
+        b"payment",
+        b"bitcoin",
+        b"wallet",
+        b"Rijndael",
+        b"salsa20",
+    ],
+    
+    # Anti-analysis techniques
+    "anti_analysis": [
+        b"IsDebuggerPresent",
+        b"CheckRemoteDebuggerPresent",
+        b"GetTickCount",
+        b"QueryPerformanceCounter",
+        b"Sleep(",
+        b"VirtualBox",
+        b"VMware",
+        b"Sandboxie",
+        b"SbieDll.dll",
+        b"GetModuleHandle",
+        b"ObfuscatedString",
+        b"FindWindow",
+        b"GetWindowText",
+        b"ptrace(",
+        b"IsProcessorFeaturePresent",
+    ],
+}
+
+class FileScanner:
+    """Scans file system for malicious content and suspicious patterns."""
+    
+    def __init__(self, callback: Optional[Callable[[FileThreat], None]] = None):
+        """
+        Initialize the file scanner.
+        
+        Args:
+            callback: Function to call when a threat is detected
+        """
+        self.callback = callback
+        self.scan_config = CONFIG["scan_settings"]
+        self.stop_scan = False
+        self.current_scan = None
+        self._scan_stats = {
+            "files_scanned": 0,
+            "threats_found": 0,
+            "bytes_scanned": 0,
+            "start_time": None,
+            "end_time": None,
+            "current_file": None,
+            "progress": 0.0
+        }
+        
+    @property
+    def scan_stats(self) -> Dict:
+        """Return current scan statistics."""
+        return self._scan_stats.copy()
+        
+    def calculate_file_hash(self, filepath: str, block_size: int = 65536) -> Optional[str]:
+        """
+        Calculate MD5 hash of a file.
+        
+        Args:
+            filepath: Path to the file
+            block_size: Size of chunks to read from file
+            
+        Returns:
+            MD5 hash of the file as a hexadecimal string, or None if the file could not be read
+        """
+        hasher = hashlib.md5()
+        try:
+            with open(filepath, 'rb') as f:
+                buf = f.read(block_size)
+                while len(buf) > 0:
+                    hasher.update(buf)
+                    buf = f.read(block_size)
+            return hasher.hexdigest()
+        except (IOError, PermissionError) as e:
+            logger.warning(f"Could not hash file {filepath}: {e}")
+            return None
+            
+    def is_suspicious_content(self, filepath: str, block_size: int = 65536) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """
+        Check if file contains suspicious patterns using advanced heuristic detection.
+        
+        Implements multiple detection layers:
+        1. Signature-based detection for known patterns
+        2. Entropy analysis for encryption/packing
+        3. Behavioral analysis based on functionality
+        4. Contextual analysis based on file location and type
+        
+        Args:
+            filepath: Path to the file
+            block_size: Size of chunks to read from file
+            
+        Returns:
+            Tuple of (is_suspicious, reason, details)
+        """
+        try:
+            # Get file extension and size
+            file_ext = os.path.splitext(filepath)[1].lower()
+            file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+            
+            # Analyze executables with special attention
+            is_executable = file_ext in ['.exe', '.dll', '.bat', '.ps1', '.vbs', '.js', '.cmd', '.scr', '.pif', '.com']
+            is_script = file_ext in ['.ps1', '.vbs', '.js', '.py', '.bat', '.cmd', '.sh']
+            is_document = file_ext in ['.doc', '.docx', '.xls', '.xlsx', '.pdf', '.rtf']
+            is_packed = False
+            
+            # Initialize detailed threat analysis
+            found_patterns = {}
+            threat_score = 0
+            entropy_score = 0
+            behavioral_indicators = {}
+            
+            # Full file analysis for smaller files, or block analysis for larger files
+            if file_size <= block_size * 2 or is_executable:
+                # Read complete file for thorough analysis
+                with open(filepath, 'rb') as f:
+                    content = f.read()
+            else:
+                # Read first and last blocks for larger files
+                with open(filepath, 'rb') as f:
+                    first_block = f.read(block_size)
+                    
+                    # Try to seek to the end block
+                    try:
+                        f.seek(-block_size, os.SEEK_END)
+                        last_block = f.read(block_size)
+                        content = first_block + last_block
+                    except:
+                        # If seeking fails, just use the first block
+                        content = first_block
+            
+            # ----------------------------
+            # 1. Pattern-based detection
+            # ----------------------------
+            # Check each category of suspicious patterns
+            for category, patterns in SUSPICIOUS_PATTERNS.items():
+                for pattern in patterns:
+                    if pattern in content:
+                        if category not in found_patterns:
+                            found_patterns[category] = []
+                        found_patterns[category].append(pattern.decode('utf-8', errors='ignore'))
+                        
+                        # Increment threat score based on category severity and context
+                        base_score = 0
+                        if category in ['command_execution', 'encryption', 'anti_analysis']:
+                            base_score = 3  # More severe
+                        elif category in ['memory_manipulation', 'system_modification', 'persistence']:
+                            base_score = 2  # Moderately severe
+                        else:
+                            base_score = 1  # Less severe
+                        
+                        # Adjust score based on file type context
+                        if is_executable and category in ['command_execution', 'anti_analysis', 'persistence']:
+                            base_score *= 1.5  # More suspicious in executables
+                        elif is_script and category in ['command_execution', 'system_modification']:
+                            base_score *= 1.3  # Suspicious in scripts
+                        elif is_document and category in ['command_execution', 'macro_execution']:
+                            base_score *= 2.0  # Very suspicious in documents
+                            
+                        threat_score += base_score
+            
+            # ----------------------------
+            # 2. Entropy analysis
+            # ----------------------------
+            # Calculate Shannon entropy to detect encryption/packing
+            if len(content) > 256:  # Only meaningful for larger content
+                byte_counts = {byte: 0 for byte in range(256)}
+                for byte in content:
+                    byte_counts[byte] += 1
+                
+                entropy = 0
+                for count in byte_counts.values():
+                    if count > 0:
+                        probability = count / len(content)
+                        entropy -= probability * (math.log(probability, 2) if probability > 0 else 0)
+                
+                # Entropy ranges from 0 to 8 (for bytes)
+                # High entropy (>7.0) suggests encryption or compression
+                entropy_score = entropy
+                if entropy > 7.2:
+                    is_packed = True
+                    if is_executable:
+                        # High entropy in executable = likely packed/encrypted
+                        found_patterns['high_entropy'] = [f"Entropy: {entropy:.2f}"]
+                        threat_score += 4
+                    else:
+                        # High entropy in non-executable could be normal (e.g., media file)
+                        found_patterns['high_entropy'] = [f"Entropy: {entropy:.2f}"]
+                        threat_score += 1
+            
+            # ----------------------------
+            # 3. Behavioral analysis
+            # ----------------------------
+            # Check file signatures for executable analysis
+            if is_executable and len(content) > 2:
+                # Check PE header markers for Windows executables
+                if content[0:2] == b'MZ':
+                    behavioral_indicators['is_windows_executable'] = True
+                    
+                    # Look for specific sections in PE files
+                    if b'.text' in content and b'.data' in content and b'.rsrc' in content:
+                        # Normal PE file structure
+                        pass
+                    elif is_packed:
+                        # Packed PE with high entropy but missing standard sections
+                        behavioral_indicators['packed_executable'] = True
+                        threat_score += 3
+                        
+                    # Look for specific PE characteristics
+                    if b'UPX' in content:
+                        # UPX packer is common for both legitimate and malicious files
+                        behavioral_indicators['upx_packed'] = True
+                        threat_score += 1
+                    if b'This program cannot be run in DOS mode' not in content:
+                        # Missing DOS stub - unusual
+                        behavioral_indicators['unusual_pe_format'] = True
+                        threat_score += 2
+            
+            # Check for obfuscation in scripts
+            if is_script:
+                # Check for high repetition of escape sequences or encoding functions
+                obfuscation_markers = [b'eval(', b'execute(', b'String.fromCharCode', b'\\x', b'\\u', 
+                                       b'chr(', b'base64', b'decode', b'escape(', b'unescape(']
+                obfuscation_count = sum(content.count(marker) for marker in obfuscation_markers)
+                
+                if obfuscation_count > 5:
+                    behavioral_indicators['obfuscated_script'] = True
+                    behavioral_indicators['obfuscation_markers'] = obfuscation_count
+                    threat_score += min(obfuscation_count, 10)  # Cap to avoid extreme values
+            
+            # Check for common exploit markers in documents
+            if is_document:
+                exploit_markers = [b'CVE-', b'exploit', b'shellcode', b'heap spray', b'rop chain']
+                exploit_count = sum(content.count(marker) for marker in exploit_markers)
+                
+                if exploit_count > 0:
+                    behavioral_indicators['potential_exploit_document'] = True
+                    threat_score += exploit_count * 2
+            
+            # ----------------------------
+            # 4. Contextual analysis
+            # ----------------------------
+            # Check file location for suspicious contexts
+            temp_dir = os.path.normpath(os.environ.get('TEMP', '').lower())
+            temp_dirs = [temp_dir, '/tmp', '/var/tmp']
+            
+            is_in_temp = any(os.path.normpath(filepath).lower().startswith(os.path.normpath(td)) for td in temp_dirs if td)
+            is_hidden = os.path.basename(filepath).startswith('.') or os.path.basename(filepath).startswith('~$')
+            
+            unusual_location = False
+            
+            # Check for executables in unusual locations
+            if is_executable:
+                usual_exec_paths = ['/bin', '/usr/bin', '/usr/local/bin', 'Program Files', 'Windows']
+                is_in_usual_location = any(os.path.normpath(filepath).lower().find(os.path.normpath(p).lower()) != -1 for p in usual_exec_paths)
+                
+                if not is_in_usual_location and is_in_temp:
+                    unusual_location = True
+                    behavioral_indicators['executable_in_temp'] = True
+                    threat_score += 3
+                elif is_hidden:
+                    behavioral_indicators['hidden_executable'] = True
+                    threat_score += 2
+            
+            # Check for scripts in unusual locations
+            if is_script and is_hidden:
+                behavioral_indicators['hidden_script'] = True
+                threat_score += 1
+            
+            # Combine all analysis results
+            if found_patterns or entropy_score > 7.0 or behavioral_indicators:
+                # Generate a comprehensive reason based on all findings
+                reasons = []
+                
+                if found_patterns:
+                    categories = list(found_patterns.keys())
+                    if len(categories) == 1:
+                        reasons.append(f"Contains {categories[0]} pattern")
+                    else:
+                        reasons.append(f"Contains multiple suspicious patterns: {', '.join(categories)}")
+                
+                if entropy_score > 7.0:
+                    reasons.append(f"High entropy suggesting encryption/packing ({entropy_score:.2f})")
+                
+                for indicator, value in behavioral_indicators.items():
+                    if indicator == 'obfuscated_script':
+                        reasons.append(f"Script contains obfuscation techniques ({value} markers)")
+                    elif indicator == 'packed_executable':
+                        reasons.append("Executable appears to be packed/protected")
+                    elif indicator == 'executable_in_temp':
+                        reasons.append("Executable found in temporary directory")
+                    elif indicator == 'hidden_executable':
+                        reasons.append("Hidden executable file")
+                    elif indicator == 'potential_exploit_document':
+                        reasons.append("Document contains potential exploit markers")
+                
+                reason = " | ".join(reasons)
+                
+                # Compile detailed analysis
+                details = {
+                    "patterns": found_patterns,
+                    "entropy_analysis": {
+                        "score": entropy_score,
+                        "is_packed": is_packed
+                    },
+                    "behavioral_analysis": behavioral_indicators,
+                    "contextual_analysis": {
+                        "is_in_temp": is_in_temp,
+                        "is_hidden": is_hidden,
+                        "unusual_location": unusual_location
+                    },
+                    "threat_score": threat_score,
+                    "file_type": {
+                        "is_executable": is_executable,
+                        "is_script": is_script,
+                        "is_document": is_document
+                    }
+                }
+                
+                # Higher score for combinations of different pattern types
+                if found_patterns and len(list(found_patterns.keys())) > 1:
+                    categories = list(found_patterns.keys())
+                    threat_score += len(categories)
+                    
+                    # Particularly dangerous combinations
+                    if 'encryption' in categories and any(c in categories for c in ['data_exfiltration', 'persistence']):
+                        details["potential_ransomware"] = True
+                        threat_score += 5
+                        
+                    if 'anti_analysis' in categories and any(c in categories for c in ['memory_manipulation', 'system_modification']):
+                        details["potential_rootkit"] = True
+                        threat_score += 5
+                
+                return True, reason, details
+                
+            return False, None, None
+        except (IOError, PermissionError) as e:
+            logger.warning(f"Could not scan content of {filepath}: {e}")
+            return False, None, None
+    
+    def should_scan_file(self, filepath: str) -> bool:
+        """
+        Determine if a file should be scanned based on configuration.
+        
+        Args:
+            filepath: Path to the file
+            
+        Returns:
+            Boolean indicating if file should be scanned
+        """
+        path = Path(filepath)
+        
+        # Skip if file doesn't exist or is a directory
+        if not path.is_file():
+            return False
+            
+        # Check file size limit
+        max_size = self.scan_config["max_file_size_mb"] * 1024 * 1024
+        try:
+            if path.stat().st_size > max_size:
+                return False
+        except (OSError, PermissionError):
+            return False
+            
+        # Check if hidden (platform-independent approach)
+        is_hidden = path.name.startswith('.')
+        # Additional Windows-specific check for hidden attribute
+        if os.name == 'nt':
+            try:
+                import ctypes
+                file_attribute_hidden = 2
+                attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+                is_hidden = is_hidden or (attrs != -1 and bool(attrs & file_attribute_hidden))
+            except (ImportError, AttributeError):
+                # Fallback if ctypes not available or other issue
+                pass
+                
+        if is_hidden and not self.scan_config["scan_hidden_files"]:
+            return False
+            
+        # Check file extension
+        if path.suffix.lower() in self.scan_config["file_extensions"]:
+            return True
+            
+        # Check if it's an executable based on file header
+        try:
+            mime = magic.Magic(mime=True)
+            file_type = mime.from_file(str(path))
+            return "application/x-executable" in file_type or "application/x-dosexec" in file_type
+        except Exception:
+            # If we can't determine file type, err on the side of caution
+            return True
+            
+    def scan_file(self, filepath: str) -> Optional[FileThreat]:
+        """
+        Scan a single file for threats.
+        
+        Args:
+            filepath: Path to the file
+            
+        Returns:
+            FileThreat object if a threat is found, None otherwise
+        """
+        if not self.should_scan_file(filepath):
+            return None
+            
+        self._scan_stats["current_file"] = filepath
+        
+        try:
+            # Update scan statistics
+            filesize = os.path.getsize(filepath)
+            self._scan_stats["files_scanned"] += 1
+            self._scan_stats["bytes_scanned"] += filesize
+            
+            # Check hash against known malicious hashes
+            file_hash = self.calculate_file_hash(filepath)
+            if file_hash and file_hash in KNOWN_MALICIOUS_HASHES:
+                threat_level = KNOWN_MALICIOUS_HASHES[file_hash]
+                threat = FileThreat(
+                    type_=ThreatType.MALWARE,
+                    level=threat_level,
+                    description=f"Known malicious file detected: {os.path.basename(filepath)}",
+                    filepath=filepath,
+                    hash_=file_hash,
+                    file_size=filesize,
+                    source="hash_database"
+                )
+                self._scan_stats["threats_found"] += 1
+                if self.callback:
+                    self.callback(threat)
+                return threat
+                
+            # Check for suspicious content
+            is_suspicious, reason, details = self.is_suspicious_content(filepath)
+            if is_suspicious:
+                # Determine threat level based on threat score
+                threat_level = ThreatLevel.MEDIUM  # Default
+                
+                if details:
+                    threat_score = details.get("threat_score", 0)
+                    
+                    if threat_score >= 10 or details.get("potential_ransomware", False):
+                        threat_level = ThreatLevel.CRITICAL
+                    elif threat_score >= 5 or details.get("potential_rootkit", False):
+                        threat_level = ThreatLevel.HIGH
+                    elif threat_score >= 3:
+                        threat_level = ThreatLevel.MEDIUM
+                    else:
+                        threat_level = ThreatLevel.LOW
+                
+                # Determine threat type based on patterns
+                threat_type = ThreatType.SUSPICIOUS_BEHAVIOR
+                if details and details.get("patterns"):
+                    patterns = details.get("patterns", {})
+                    
+                    if "encryption" in patterns and details.get("potential_ransomware", False):
+                        threat_type = ThreatType.MALWARE
+                        reason = f"Potential ransomware detected: {os.path.basename(filepath)}"
+                    elif "anti_analysis" in patterns and details.get("potential_rootkit", False):
+                        threat_type = ThreatType.MALWARE
+                        reason = f"Potential rootkit detected: {os.path.basename(filepath)}"
+                    elif "persistence" in patterns:
+                        reason = f"Persistence mechanism detected in file: {os.path.basename(filepath)}"
+                    elif "data_exfiltration" in patterns:
+                        reason = f"Data exfiltration capabilities detected: {os.path.basename(filepath)}"
+                
+                threat = FileThreat(
+                    type_=threat_type,
+                    level=threat_level,
+                    description=reason or f"Suspicious content detected in file: {os.path.basename(filepath)}",
+                    details=details,
+                    filepath=filepath,
+                    hash_=file_hash,
+                    file_size=filesize,
+                    source="enhanced_pattern_matching"
+                )
+                self._scan_stats["threats_found"] += 1
+                if self.callback:
+                    self.callback(threat)
+                return threat
+                
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error scanning file {filepath}: {e}")
+            return None
+    
+    def get_drives(self) -> List[str]:
+        """
+        Get list of available drives to scan.
+        
+        Returns:
+            List of drive paths
+        """
+        drives = []
+        
+        # Add system drive
+        drives.append(os.path.abspath(os.sep))
+        
+        # Add removable drives if configured
+        if self.scan_config["scan_external_drives"]:
+            try:
+                for partition in psutil.disk_partitions():
+                    if 'removable' in partition.opts or 'cdrom' in partition.opts:
+                        drives.append(partition.mountpoint)
+            except Exception as e:
+                logger.error(f"Error getting drives: {e}")
+                
+        return drives
+    
+    def walk_directory(self, root_path: str) -> Generator[str, None, None]:
+        """
+        Generator to walk through directory and yield file paths.
+        
+        Args:
+            root_path: Starting directory path
+            
+        Yields:
+            File paths to scan
+        """
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            # Check if scan was stopped
+            if self.stop_scan:
+                break
+                
+            # Skip hidden directories if configured
+            if not self.scan_config["scan_hidden_files"]:
+                dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+                
+            for filename in filenames:
+                yield os.path.join(dirpath, filename)
+    
+    def scan_path(self, path: str, recursive: bool = True) -> List[FileThreat]:
+        """
+        Scan a path for threats.
+        
+        Args:
+            path: Path to scan
+            recursive: Whether to scan recursively
+            
+        Returns:
+            List of detected threats
+        """
+        threats = []
+        
+        if not os.path.exists(path):
+            logger.warning(f"Path does not exist: {path}")
+            return threats
+            
+        self._scan_stats["current_file"] = path
+        
+        if os.path.isfile(path):
+            threat = self.scan_file(path)
+            if threat:
+                threats.append(threat)
+        elif os.path.isdir(path) and recursive:
+            file_count = sum([len(files) for _, _, files in os.walk(path)])
+            processed = 0
+            
+            for filepath in self.walk_directory(path):
+                if self.stop_scan:
+                    break
+                    
+                threat = self.scan_file(filepath)
+                if threat:
+                    threats.append(threat)
+                    
+                processed += 1
+                self._scan_stats["progress"] = processed / file_count if file_count > 0 else 1.0
+                
+        return threats
+    
+    def start_scan(self, paths: Optional[List[str]] = None, recursive: bool = True) -> None:
+        """
+        Start a new scan in a separate thread.
+        
+        Args:
+            paths: List of paths to scan. If None, scan all drives.
+            recursive: Whether to scan recursively
+        """
+        if self.current_scan and self.current_scan.is_alive():
+            logger.warning("A scan is already in progress")
+            return
+            
+        self.stop_scan = False
+        self._scan_stats = {
+            "files_scanned": 0,
+            "threats_found": 0,
+            "bytes_scanned": 0,
+            "start_time": datetime.now(),
+            "end_time": None,
+            "current_file": None,
+            "progress": 0.0
+        }
+        
+        if not paths:
+            paths = self.get_drives()
+            
+        self.current_scan = threading.Thread(
+            target=self._scan_thread,
+            args=(paths, recursive),
+            daemon=True
+        )
+        self.current_scan.start()
+        
+    def _scan_thread(self, paths: List[str], recursive: bool) -> None:
+        """
+        Thread function to perform scanning.
+        
+        Args:
+            paths: List of paths to scan
+            recursive: Whether to scan recursively
+        """
+        threats = []
+        
+        try:
+            for path in paths:
+                if self.stop_scan:
+                    break
+                path_threats = self.scan_path(path, recursive)
+                threats.extend(path_threats)
+        except Exception as e:
+            logger.error(f"Error during scan: {e}")
+        finally:
+            self._scan_stats["end_time"] = datetime.now()
+            logger.info(f"Scan completed. Scanned {self._scan_stats['files_scanned']} files, "
+                       f"found {self._scan_stats['threats_found']} threats.")
+    
+    def stop_scanning(self) -> None:
+        """Stop the current scan."""
+        self.stop_scan = True
+        if self.current_scan and self.current_scan.is_alive():
+            self.current_scan.join(timeout=2.0)
