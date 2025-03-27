@@ -38,8 +38,8 @@ A comprehensive desktop threat detection tool with dark web monitoring, file sys
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yourusername/cyberfox.git
-   cd cyberfox
+   git clone https://github.com/ShauryaCipher/Threat-Shield.git
+   cd Threat-Shield
    ```
 
 2. Install the required packages:
